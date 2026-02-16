@@ -8,7 +8,9 @@ import (
 	"os/signal"
 
 	"github.com/emersion/go-imap/server"
+
 	"github.com/foxcpp/go-imap-maildir"
+	"github.com/foxcpp/go-imap-maildir/maildir/fs"
 )
 
 func main() {
@@ -21,7 +23,7 @@ func main() {
 	pathTemplate := os.Args[1]
 	endpoint := os.Args[2]
 
-	bkd, err := imapmaildir.New(pathTemplate)
+	bkd, err := imapmaildir.New(pathTemplate, fs.Provider{}, nil)
 	bkd.Debug = log.New(os.Stderr, "imapmaildir[debug]: ", 0)
 	defer bkd.Close()
 	if err != nil {

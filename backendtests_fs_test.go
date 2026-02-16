@@ -1,22 +1,23 @@
 package imapmaildir
 
 import (
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
 	"testing"
 
 	backendtests "github.com/foxcpp/go-imap-backend-tests"
+
+	"github.com/foxcpp/go-imap-maildir/maildir/fs"
 )
 
 func initTestBackend() backendtests.Backend {
-	tempDir, err := ioutil.TempDir("", "go-imap-maildir-")
+	tempDir, err := os.MkdirTemp("", "go-imap-maildir-")
 	if err != nil {
 		panic(err)
 	}
 
-	be, err := New(tempDir + "/{username}")
+	be, err := New(tempDir+"/{username}", fs.Provider{}, nil)
 	if err != nil {
 		panic(err)
 	}

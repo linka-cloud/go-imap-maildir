@@ -3,368 +3,837 @@ package imapmaildir
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/asdine/storm/v3"
+	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
-	"github.com/emersion/go-maildir"
-	"go.etcd.io/bbolt"
+
+	"github.com/foxcpp/go-imap-maildir/maildir"
 )
 
 const (
 	InboxName      = "INBOX"
 	HierarchySep   = "."
 	MaxMboxNesting = 100
-
-	IndexFile = "imapmaildir-index.db"
 )
 
 func validMboxPart(name string) bool {
-	// Restrict characters that may be problematic for FS handling.
-
-	// This is list of characters not allowed in NTFS minus 0x00 (handled
-	// below), in Unix world many of these characters may be troublesome to
-	// handle in shell scripts.
 	if strings.ContainsAny(name, ":*?\"<>|") {
 		return false
 	}
-	// Disallow ASCII control characters (including 0x00).
 	for _, ch := range name {
 		if ch < ' ' {
 			return false
 		}
 	}
-	// Prevent directory structure escaping.
 	return !strings.Contains(name, "..")
+}
+
+func (u *User) validateMboxName(mbox string) error {
+	if strings.EqualFold(mbox, InboxName) {
+		return nil
+	}
+	parts := strings.Split(mbox, HierarchySep)
+	if len(parts) > MaxMboxNesting {
+		return errors.New("mailbox nesting limit exceeded")
+	}
+	for i, part := range parts {
+		if i == 0 && strings.EqualFold(part, InboxName) {
+			continue
+		}
+		if part == "" {
+			if i != len(parts)-1 {
+				return errors.New("illegal mailbox name")
+			}
+			continue
+		}
+		if !validMboxPart(part) {
+			u.b.Log.Printf("illegal mailbox name requested by %s: %v", u.name, mbox)
+			return errors.New("illegal mailbox name")
+		}
+	}
+	return nil
+}
+
+func mailboxAncestors(mbox string) []string {
+	if strings.EqualFold(mbox, InboxName) {
+		return []string{InboxName}
+	}
+	parts := strings.Split(mbox, HierarchySep)
+	ancestors := make([]string, 0, len(parts))
+	current := ""
+	for i, part := range parts {
+		if i == 0 && strings.EqualFold(part, InboxName) {
+			continue
+		}
+		if part == "" {
+			continue
+		}
+		if current == "" {
+			current = part
+		} else {
+			current = current + HierarchySep + part
+		}
+		ancestors = append(ancestors, current)
+	}
+	return ancestors
+}
+
+func relativeMailboxName(existingName, newName string) (string, error) {
+	if strings.EqualFold(existingName, InboxName) {
+		return newName, nil
+	}
+	parts := strings.Split(existingName, HierarchySep)
+	if len(parts) <= 1 {
+		return newName, nil
+	}
+	parent := strings.Join(parts[:len(parts)-1], HierarchySep)
+	if parent == "" {
+		return newName, nil
+	}
+	prefix := parent + HierarchySep
+	if !strings.HasPrefix(newName, prefix) {
+		return "", errors.New("illegal mailbox name")
+	}
+	rel := strings.TrimPrefix(newName, prefix)
+	if rel == "" {
+		return "", errors.New("illegal mailbox name")
+	}
+	return rel, nil
 }
 
 type User struct {
 	b *Backend
 
-	name     string
-	basePath string
-}
+	name    string
+	storage maildir.Storage
 
-func (u *User) prepareMboxPath(mbox string) (fsPath string, parts []string, err error) {
-	if strings.EqualFold(mbox, InboxName) {
-		return u.basePath, []string{}, nil
-	}
+	mailboxesLock sync.Mutex
+	mailboxes     map[string]*Mailbox
 
-	// Verify validity before attempting to do anything.
-	if len(parts) > MaxMboxNesting {
-		return "", nil, errors.New("mailbox nesting limit exceeded")
-	}
-	fsPath = u.basePath
-	nameParts := strings.Split(mbox, HierarchySep)
-	for i, part := range nameParts {
-		if part == "" {
-			// Strip the possible trailing separator but not allow empty parts
-			// in general.
-			if i != len(parts)-1 {
-				return "", nil, errors.New("illegal mailbox name")
-			}
-			continue
-		}
+	limitLock   sync.Mutex
+	appendLimit *uint32
 
-		if !validMboxPart(part) {
-			u.b.Log.Printf("illegal mailbox name requested by %s: %v", u.name, mbox)
-			return "", nil, errors.New("illegal mailbox name")
-		}
-		fsPath += string(filepath.Separator) + "." + part
-	}
-
-	return fsPath, parts, nil
-}
-
-func (u *User) mboxName(fsPath string) (string, error) {
-	fsPath = strings.TrimPrefix(fsPath, u.basePath+string(filepath.Separator))
-	if fsPath == "" {
-		return InboxName, nil
-	}
-
-	parts := strings.Split(fsPath, string(filepath.Separator))
-	if len(parts) > MaxMboxNesting {
-		return "", errors.New("mailbox nesting limit exceeded")
-	}
-
-	mboxParts := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if !strings.HasPrefix(part, ".") {
-			return "", fmt.Errorf("not a maildir++ path: %v", fsPath)
-		}
-
-		mboxParts = append(mboxParts, part[1:])
-	}
-
-	return strings.Join(mboxParts, HierarchySep), nil
+	mboxLimitLock sync.Mutex
+	mboxLimits    map[string]*uint32
 }
 
 func (u *User) Username() string {
 	return u.name
 }
 
-func (u *User) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
-	// TODO: Figure out a fast way to filter subscribed/unsubscribed
-	// directories.
+func (u *User) getMailbox(mbox string) (*Mailbox, bool) {
+	u.mailboxesLock.Lock()
+	defer u.mailboxesLock.Unlock()
 
-	mboxes := []backend.Mailbox{
-		&Mailbox{
-			// Inbox always exists.
-			name: InboxName,
-			path: u.basePath,
-		},
+	mb, ok := u.mailboxes[mbox]
+	return mb, ok
+}
+
+type DefaultMailboxSpec struct {
+	Name       string
+	SpecialUse string
+}
+
+var defaultMailboxSpecs = []DefaultMailboxSpec{
+	{Name: "Trash", SpecialUse: imap.TrashAttr},
+	{Name: "Junk", SpecialUse: imap.JunkAttr},
+	{Name: "Sent", SpecialUse: imap.SentAttr},
+	{Name: "Archive", SpecialUse: imap.ArchiveAttr},
+	{Name: "Draft", SpecialUse: imap.DraftsAttr},
+}
+
+func (u *User) ensureDefaultMailboxes() {
+	specs := u.b.DefaultMailboxes
+	if len(specs) == 0 {
+		specs = defaultMailboxSpecs
+	}
+	for _, spec := range specs {
+		name := spec.Name
+		mboxDir, err := u.storage.Dir(name)
+		if err != nil {
+			continue
+		}
+		exists, err := mboxDir.Exists()
+		if err != nil {
+			continue
+		}
+		if !exists {
+			_ = u.CreateMailbox(name)
+		}
+		u.mailboxesLock.Lock()
+		mbox := u.ensureMailbox(name)
+		u.mailboxesLock.Unlock()
+		if spec.SpecialUse != "" {
+			_ = u.setMailboxSpecialUse(mbox, spec.SpecialUse)
+		}
+	}
+}
+
+func defaultMailboxSpecialUse(name string) (string, bool) {
+	for _, spec := range defaultMailboxSpecs {
+		if strings.EqualFold(spec.Name, name) {
+			return spec.SpecialUse, true
+		}
+	}
+	return "", false
+}
+
+func (u *User) setMailboxSpecialUse(mbox *Mailbox, value string) error {
+	if mbox == nil {
+		return nil
+	}
+	if err := mbox.loadMetadataState(); err != nil {
+		return err
+	}
+	mbox.state.meta.EnsureGUID()
+	if err := mbox.writeMetadataState(mbox.state.meta); err != nil {
+		return err
+	}
+	key := "priv/" + mbox.state.meta.GUID + "/specialuse"
+	attrsStore, err := u.storage.Attributes()
+	if err != nil {
+		return err
+	}
+	attrs, err := attrsStore.Read()
+	if err != nil {
+		return err
+	}
+	if value == "" {
+		delete(attrs, key)
+	} else {
+		attrs[key] = value
+	}
+	return attrsStore.Write(attrs)
+}
+
+func (u *User) mailboxSpecialUse(mbox *Mailbox) ([]string, error) {
+	if mbox == nil {
+		return nil, nil
+	}
+	if err := mbox.loadMetadataState(); err != nil {
+		return nil, err
+	}
+	guid := mbox.state.meta.GUID
+	if guid == "" {
+		return nil, nil
+	}
+	attrsStore, err := u.storage.Attributes()
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := attrsStore.Read()
+	if err != nil {
+		return nil, err
+	}
+	value := attrs["priv/"+guid+"/specialuse"]
+	if value == "" {
+		return nil, nil
+	}
+	return strings.Fields(value), nil
+}
+
+func (u *User) ensureMailbox(mbox string) *Mailbox {
+	if m, ok := u.mailboxes[mbox]; ok {
+		return m
 	}
 
-	err := filepath.Walk(u.basePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Ignore errors, return as much as possible.
-			u.b.Log.Printf("error during mailboxes iteration: %v", err)
-			return nil
-		}
-		if !info.IsDir() {
-			return nil
-		}
-
-		// Inbox is already added explicitly above.
-		if path == u.basePath {
-			return nil
-		}
-
-		if !strings.HasPrefix(info.Name(), ".") {
-			return filepath.SkipDir
-		}
-
-		mboxName, err := u.mboxName(path)
-		if err != nil {
-			u.b.Log.Printf("error during mailboxes iteration: %v", err)
-			return filepath.SkipDir
-		}
-
-		u.b.Debug.Printf("listing mbox (%v, %v)", mboxName, path)
-
-		// Note that Mailbox object has nil handle.
-		mboxes = append(mboxes, &Mailbox{
-			b:        u.b,
-			username: u.name,
-			name:     mboxName,
-			path:     path,
-		})
+	mboxDir, err := u.storage.Dir(mbox)
+	if err != nil {
 		return nil
-	})
+	}
+
+	mboxObj := &Mailbox{
+		b:          u.b,
+		user:       u,
+		name:       mbox,
+		dir:        mboxDir,
+		state:      u.b.getMailboxState(u.name, mbox),
+		subscribed: true,
+	}
+	if u.mailboxes == nil {
+		u.mailboxes = map[string]*Mailbox{}
+	}
+	u.mailboxes[mbox] = mboxObj
+	return mboxObj
+}
+
+func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
+	u.mailboxesLock.Lock()
+	defer u.mailboxesLock.Unlock()
+
+	if u.mailboxes == nil {
+		u.mailboxes = map[string]*Mailbox{}
+	}
+
+	var mboxes []imap.MailboxInfo
+
+	inbox := u.ensureMailbox(InboxName)
+	if !subscribed || inbox.subscribed {
+		info, err := inbox.Info()
+		if err == nil {
+			mboxes = append(mboxes, *info)
+		}
+	}
+
+	names, err := u.storage.ListDirs()
 	if err != nil {
 		u.b.Log.Printf("failed to list mailboxes: %v", err)
-		return nil, errors.New("I/O error")
+		return nil, fmt.Errorf("I/O error: %w", err)
+	}
+	for _, name := range names {
+		mbox := u.ensureMailbox(name)
+		if mbox == nil {
+			continue
+		}
+		if subscribed && !mbox.subscribed {
+			continue
+		}
+		mboxInfo, err := mbox.Info()
+		if err != nil {
+			continue
+		}
+		mboxes = append(mboxes, *mboxInfo)
 	}
 
 	return mboxes, nil
 }
 
-func (u *User) openDB(fsPath, mbox string) (*storm.DB, error) {
-	u.b.dbsLock.Lock()
-	defer u.b.dbsLock.Unlock()
-
-	key := u.name + "\x00" + mbox
-	handle, ok := u.b.dbs[key]
-	if ok {
-		handle.uses++
-		u.b.Debug.Printf("%d uses for %s/%s mbox", handle.uses, u.name, mbox)
-		u.b.dbs[key] = handle
-		db := handle.db
-		return db, nil
+func (u *User) GetMailbox(name string, readOnly bool, conn backend.Conn) (*imap.MailboxStatus, backend.Mailbox, error) {
+	if err := u.validateMboxName(name); err != nil {
+		return nil, nil, err
 	}
-
-	db, err := storm.Open(filepath.Join(fsPath, IndexFile))
+	mboxDir, err := u.storage.Dir(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	u.b.dbs[key] = mailboxHandle{
-		uses: 1,
-		db:   db,
-	}
-
-	return db, nil
-}
-
-func (u *User) GetMailbox(mbox string) (backend.Mailbox, error) {
-	fsPath, _, err := u.prepareMboxPath(mbox)
+	exists, err := mboxDir.Exists()
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("I/O error: %w", err)
+	}
+	if !exists {
+		return nil, nil, backend.ErrNoSuchMailbox
 	}
 
-	_, err = os.Stat(fsPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, backend.ErrNoSuchMailbox
-		}
-		u.b.Log.Printf("failed to get mailbox: %v", err)
-		return nil, errors.New("I/O error")
-	}
-
-	handle, err := u.openDB(fsPath, mbox)
-	if err != nil {
-		u.b.Log.Printf("failed to open DB: %v", err)
-		return nil, errors.New("I/O error, try again more")
-	}
-	err = handle.Bolt.Update(func(btx *bbolt.Tx) error {
-		tx := handle.WithTransaction(btx)
-		var data mboxData
-		err := tx.One("Dummy", 1, &data)
-		if err == nil {
-			return nil
-		}
-		if err != storm.ErrNotFound {
-			return fmt.Errorf("read mboxData: %w", err)
-		}
-		u.b.Debug.Printf("initializing %s/%s", u.name, mbox)
-
-		data.Dummy = 1
-		data.UidNext = 1
-		data.UidValidity = uint32(time.Now().UnixNano() & 0xFFFFFFFF)
-		if err := tx.Save(&data); err != nil {
-			return fmt.Errorf("save mboxData: %w", err)
-		}
-		return nil
+	mbox := u.ensureMailbox(name)
+	status, err := u.Status(name, []imap.StatusItem{
+		imap.StatusMessages, imap.StatusRecent, imap.StatusUnseen,
+		imap.StatusUidNext, imap.StatusUidValidity,
 	})
 	if err != nil {
-		handle.Close()
-		u.b.Log.Printf("failed to init DB: %v", err)
-		return nil, errors.New("I/O error, try again later")
+		return nil, nil, err
 	}
 
-	u.b.Debug.Printf("get mbox (%v, %v)", mbox, fsPath)
-	return &Mailbox{
-		b:        u.b,
-		name:     mbox,
-		username: u.name,
-		handle:   handle,
-		dir:      maildir.Dir(fsPath),
-		path:     fsPath,
-	}, nil
+	entries, err := mbox.listEntries()
+	if err != nil {
+		return nil, nil, fmt.Errorf("I/O error: %w", err)
+	}
+
+	var uids []uint32
+	var recent imap.SeqSet
+	for _, entry := range entries {
+		uids = append(uids, entry.uid)
+		if entry.meta.recent {
+			recent.AddNum(entry.uid)
+			entry.meta.recent = false
+		}
+	}
+
+	selected := &SelectedMailbox{
+		Mailbox:  mbox,
+		conn:     conn,
+		readOnly: readOnly,
+	}
+
+	handle, err := u.b.Manager.Mailbox(mbox.mailboxKey(), selected, uids, &recent)
+	if err != nil {
+		return nil, nil, err
+	}
+	selected.handle = handle
+
+	return status, selected, nil
 }
 
-func (u *User) CreateMailbox(mbox string) error {
-	if strings.EqualFold(mbox, InboxName) {
-		return backend.ErrMailboxAlreadyExists
-	}
-
-	fsPath, _, err := u.prepareMboxPath(mbox)
-	if err != nil {
-		return err
-	}
-
-	if _, err := os.Stat(fsPath); err != nil {
-		if !os.IsNotExist(err) {
-			u.b.Debug.Printf("failed to create mailbox: %v", err)
-			return errors.New("I/O error")
+func (u *User) Status(mbox string, items []imap.StatusItem) (*imap.MailboxStatus, error) {
+	mboxObj, ok := u.getMailbox(mbox)
+	if !ok {
+		if err := u.validateMboxName(mbox); err != nil {
+			return nil, err
 		}
-	} else {
-		return backend.ErrMailboxAlreadyExists
+		mboxDir, err := u.storage.Dir(mbox)
+		if err != nil {
+			return nil, err
+		}
+		exists, err := mboxDir.Exists()
+		if err != nil {
+			return nil, fmt.Errorf("I/O error: %w", err)
+		}
+		if !exists {
+			return nil, backend.ErrNoSuchMailbox
+		}
+		u.mailboxesLock.Lock()
+		mboxObj = u.ensureMailbox(mbox)
+		u.mailboxesLock.Unlock()
 	}
 
-	if err := os.MkdirAll(fsPath, 0700); err != nil {
-		u.b.Debug.Printf("failed to create mailbox: %v", err)
-		return errors.New("I/O error")
+	entries, err := mboxObj.listEntries()
+	if err != nil {
+		return nil, fmt.Errorf("I/O error: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(fsPath, "cur"), 0700); err != nil {
-		u.b.Debug.Printf("failed to create mailbox: %v", err)
-		return errors.New("I/O error")
+	if err := mboxObj.loadMetadataState(); err != nil {
+		return nil, fmt.Errorf("I/O error: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(fsPath, "new"), 0700); err != nil {
-		u.b.Debug.Printf("failed to create mailbox: %v", err)
-		return errors.New("I/O error")
-	}
-	if err := os.MkdirAll(filepath.Join(fsPath, "tmp"), 0700); err != nil {
-		u.b.Debug.Printf("failed to create mailbox: %v", err)
-		return errors.New("I/O error")
-	}
-	// IMAP index will be created on demand on first SELECT.
 
-	u.b.Debug.Printf("create mbox (%v, %v)", mbox, fsPath)
+	status := imap.NewMailboxStatus(mboxObj.name, items)
+	baseFlags := []string{imap.SeenFlag, imap.AnsweredFlag, imap.FlaggedFlag, imap.DeletedFlag, imap.DraftFlag}
+	status.Flags = append([]string{}, baseFlags...)
+	status.PermanentFlags = append([]string{}, baseFlags...)
+	status.PermanentFlags = append(status.PermanentFlags, "\\*")
+	status.UnseenSeqNum = 0
+
+	flagsMap := map[string]struct{}{}
+	for _, entry := range entries {
+		for _, flag := range entry.meta.flags {
+			flagsMap[flag] = struct{}{}
+		}
+	}
+	flagSeen := map[string]struct{}{}
+	for _, flag := range status.Flags {
+		flagSeen[flag] = struct{}{}
+	}
+	permSeen := map[string]struct{}{}
+	for _, flag := range status.PermanentFlags {
+		permSeen[flag] = struct{}{}
+	}
+	for flag := range flagsMap {
+		if _, ok := flagSeen[flag]; !ok {
+			status.Flags = append(status.Flags, flag)
+			flagSeen[flag] = struct{}{}
+		}
+		if _, ok := permSeen[flag]; !ok {
+			status.PermanentFlags = append(status.PermanentFlags, flag)
+			permSeen[flag] = struct{}{}
+		}
+	}
+
+	for i, entry := range entries {
+		seqNum := uint32(i + 1)
+		if !hasFlag(entry.meta.flags, imap.SeenFlag) && status.UnseenSeqNum == 0 {
+			status.UnseenSeqNum = seqNum
+		}
+	}
+
+	for _, item := range items {
+		switch item {
+		case imap.StatusMessages:
+			status.Messages = uint32(len(entries))
+		case imap.StatusUidNext:
+			u.b.statesLock.Lock()
+			if mboxObj.state.meta != nil {
+				status.UidNext = mboxObj.state.meta.UIDNext
+			} else {
+				status.UidNext = mboxObj.state.uidNext
+			}
+			u.b.statesLock.Unlock()
+		case imap.StatusUidValidity:
+			status.UidValidity = mboxObj.uidValidity()
+		case imap.StatusRecent:
+			for _, entry := range entries {
+				if entry.meta.recent {
+					status.Recent++
+				}
+			}
+		case imap.StatusUnseen:
+			for _, entry := range entries {
+				if !hasFlag(entry.meta.flags, imap.SeenFlag) {
+					status.Unseen++
+				}
+			}
+		case imap.StatusAppendLimit:
+			limit := u.mailboxLimit(mboxObj)
+			if limit == nil {
+				limit = mboxObj.CreateMessageLimit()
+			}
+			if limit != nil {
+				status.AppendLimit = *limit
+			} else {
+				status.AppendLimit = 0
+			}
+		}
+	}
+
+	return status, nil
+}
+
+func (u *User) SetSubscribed(mbox string, subscribed bool) error {
+	mboxObj, ok := u.getMailbox(mbox)
+	if !ok {
+		return backend.ErrNoSuchMailbox
+	}
+	mboxObj.subscribed = subscribed
+	return nil
+}
+
+func (u *User) CreateMessageLimit() *uint32 {
+	u.limitLock.Lock()
+	defer u.limitLock.Unlock()
+
+	if u.appendLimit == nil {
+		return nil
+	}
+	val := *u.appendLimit
+	return &val
+}
+
+func (u *User) SetMessageLimit(val *uint32) error {
+	u.limitLock.Lock()
+	defer u.limitLock.Unlock()
+
+	if val == nil {
+		u.appendLimit = nil
+		return nil
+	}
+	copyVal := *val
+	u.appendLimit = &copyVal
+	return nil
+}
+
+func (u *User) effectiveLimit(selected backend.Mailbox, mbox *Mailbox) *uint32 {
+	if limit := u.mailboxLimit(mbox); limit != nil {
+		return limit
+	}
+	if selected != nil {
+		if sel, ok := selected.(*SelectedMailbox); ok {
+			if limit := sel.CreateMessageLimit(); limit != nil {
+				return limit
+			}
+		}
+	}
+	if mbox != nil {
+		if limit := mbox.CreateMessageLimit(); limit != nil {
+			return limit
+		}
+	}
+	if limit := u.CreateMessageLimit(); limit != nil {
+		return limit
+	}
+	return u.b.CreateMessageLimit()
+}
+
+func (u *User) setMailboxLimit(name string, val *uint32) {
+	u.mboxLimitLock.Lock()
+	defer u.mboxLimitLock.Unlock()
+
+	if u.mboxLimits == nil {
+		u.mboxLimits = map[string]*uint32{}
+	}
+	if val == nil {
+		delete(u.mboxLimits, name)
+		return
+	}
+	copyVal := *val
+	u.mboxLimits[name] = &copyVal
+}
+
+func (u *User) mailboxLimit(mbox *Mailbox) *uint32 {
+	if mbox == nil {
+		return nil
+	}
+	u.mboxLimitLock.Lock()
+	defer u.mboxLimitLock.Unlock()
+
+	if u.mboxLimits == nil {
+		return nil
+	}
+	val, ok := u.mboxLimits[mbox.name]
+	if !ok || val == nil {
+		return nil
+	}
+	copyVal := *val
+	return &copyVal
+}
+
+func (u *User) CreateMessage(mboxName string, flags []string, date time.Time, body imap.Literal, selected backend.Mailbox) error {
+	mbox, ok := u.getMailbox(mboxName)
+	if !ok {
+		return backend.ErrNoSuchMailbox
+	}
+
+	newFlags := flags[:0]
+	for _, flag := range flags {
+		if flag == imap.RecentFlag {
+			continue
+		}
+		newFlags = append(newFlags, flag)
+	}
+	flags = uniqueFlags(newFlags)
+
+	if date.IsZero() {
+		date = time.Now()
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return errors.New("I/O error, try again later")
+	}
+
+	if limit := u.effectiveLimit(selected, mbox); limit != nil {
+		if uint32(len(data)) > *limit {
+			return backend.ErrTooBig
+		}
+	}
+	if err := mbox.loadMetadataState(); err != nil {
+		return errors.New("I/O error, try again later")
+	}
+
+	msg, writer, err := mbox.dir.Create(mbox.maildirFlagsFromImap(flags))
+	if err != nil {
+		return errors.New("I/O error, try again later")
+	}
+	if _, err := writer.Write(data); err != nil {
+		_ = writer.Close()
+		return errors.New("I/O error, try again later")
+	}
+	if err := writer.Close(); err != nil {
+		return errors.New("I/O error, try again later")
+	}
+	if err := msg.Chtimes(date, date); err != nil {
+		u.b.Log.Printf("CreateMessage: chtimes: %v", err)
+	}
+
+	u.b.statesLock.Lock()
+	uid := mbox.state.meta.UIDNext
+	mbox.state.meta.UIDNext++
+	mbox.state.meta.UIDByKey[msg.Key()] = uid
+	mbox.state.meta.FilenameByUID[uid] = msg.Name()
+	mbox.state.meta.DirtyUIDList = true
+	meta := &messageMeta{
+		uid:          uid,
+		flags:        flags,
+		internalDate: date,
+	}
+	mbox.state.uidNext = mbox.state.meta.UIDNext
+	mbox.state.messages[msg.Key()] = meta
+	storeRecent := u.b.Manager.NewMessage(mbox.mailboxKey(), meta.uid)
+	meta.recent = storeRecent
+	u.b.statesLock.Unlock()
+
+	if err := mbox.writeMetadataState(mbox.state.meta); err != nil {
+		return errors.New("I/O error, try again later")
+	}
 
 	return nil
 }
 
-func (u *User) DeleteMailbox(mbox string) error {
-	if strings.EqualFold(mbox, InboxName) {
-		return errors.New("cannot delete inbox")
+func (u *User) CreateMailbox(name string) error {
+	if strings.EqualFold(name, InboxName) {
+		u.mailboxesLock.Lock()
+		mbox := u.ensureMailbox(InboxName)
+		u.mailboxesLock.Unlock()
+		if mbox == nil {
+			return errors.New("I/O error")
+		}
+		if err := mbox.dir.Init(); err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
+		return nil
 	}
-
-	fsPath, _, err := u.prepareMboxPath(mbox)
+	if err := u.validateMboxName(name); err != nil {
+		return err
+	}
+	mboxDir, err := u.storage.Dir(name)
 	if err != nil {
 		return err
 	}
-
-	if _, err := os.Stat(fsPath); err != nil {
-		if os.IsNotExist(err) {
-			return backend.ErrNoSuchMailbox
-		}
-		u.b.Debug.Printf("failed to delete mailbox: %v", err)
-		return errors.New("I/O error")
+	exists, err := mboxDir.Exists()
+	if err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+	if exists {
+		return backend.ErrMailboxAlreadyExists
 	}
 
-	// Delete in that order to
-	// 1. Prevent IMAP SELECT.
-	if err := os.RemoveAll(filepath.Join(fsPath, IndexFile)); err != nil {
-		if !os.IsNotExist(err) {
-			u.b.Log.Printf("failed to remove mailbox: %v", err)
-			return errors.New("I/O error")
+	for _, ancestor := range mailboxAncestors(name) {
+		dir, err := u.storage.Dir(ancestor)
+		if err != nil {
+			return err
 		}
-	}
-	// 2. Prevent new maildir deliveries.
-	if err := os.RemoveAll(filepath.Join(fsPath, "tmp")); err != nil {
-		if !os.IsNotExist(err) {
-			u.b.Log.Printf("failed to remove mailbox: %v", err)
-			return errors.New("I/O error")
+		if err := dir.Init(); err != nil {
+			return fmt.Errorf("I/O error: %w", err)
 		}
-	}
-	// 3. Prevent in-flight maildir deliveries from completing.
-	if err := os.RemoveAll(filepath.Join(fsPath, "new")); err != nil {
-		if !os.IsNotExist(err) {
-			u.b.Log.Printf("failed to remove mailbox: %v", err)
-			return errors.New("I/O error")
-		}
-	}
-	// ... and remove all messages
-	if err := os.RemoveAll(filepath.Join(fsPath, "cur")); err != nil {
-		if !os.IsNotExist(err) {
-			u.b.Log.Printf("failed to remove mailbox: %v", err)
+		u.mailboxesLock.Lock()
+		mbox := u.ensureMailbox(ancestor)
+		u.mailboxesLock.Unlock()
+		if mbox == nil {
 			return errors.New("I/O error")
 		}
 	}
 
-	u.b.Debug.Printf("delete mbox (%v, %v)", mbox, fsPath)
+	if use, ok := defaultMailboxSpecialUse(name); ok {
+		u.mailboxesLock.Lock()
+		mbox := u.ensureMailbox(name)
+		u.mailboxesLock.Unlock()
+		if mbox == nil {
+			return errors.New("I/O error")
+		}
+		if err := u.setMailboxSpecialUse(mbox, use); err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
+	}
 
+	return nil
+}
+
+func (u *User) DeleteMailbox(name string) error {
+	if strings.EqualFold(name, InboxName) {
+		return errors.New("cannot delete inbox")
+	}
+	if err := u.validateMboxName(name); err != nil {
+		return err
+	}
+	mboxDir, err := u.storage.Dir(name)
+	if err != nil {
+		return err
+	}
+	exists, err := mboxDir.Exists()
+	if err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+	if !exists {
+		return backend.ErrNoSuchMailbox
+	}
+
+	childExists := false
+	children, err := mboxDir.Children()
+	if err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+	if len(children) > 0 {
+		childExists = true
+	}
+
+	if err := mboxDir.Remove(childExists); err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+
+	u.mailboxesLock.Lock()
+	delete(u.mailboxes, name)
+	u.mailboxesLock.Unlock()
+
+	u.b.deleteMailboxState(u.name, name)
+	u.b.Manager.MailboxDestroyed(u.name + "\x00" + name)
 	return nil
 }
 
 func (u *User) RenameMailbox(existingName, newName string) error {
+	if err := u.validateMboxName(existingName); err != nil {
+		return err
+	}
+	if err := u.validateMboxName(newName); err != nil {
+		return err
+	}
 	if strings.EqualFold(existingName, InboxName) {
-		// TODO: Handle special case of INBOX move.
-		return errors.New("not implemented")
-	}
+		if _, ok := u.getMailbox(newName); ok {
+			return backend.ErrMailboxAlreadyExists
+		}
+		destDir, err := u.storage.Dir(newName)
+		if err != nil {
+			return err
+		}
+		exists, err := destDir.Exists()
+		if err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
+		if exists {
+			return backend.ErrMailboxAlreadyExists
+		}
+		if err := destDir.Init(); err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
 
-	fsPathOld, _, err := u.prepareMboxPath(existingName)
+		inbox := u.ensureMailbox(existingName)
+		dest := u.ensureMailbox(newName)
+		if inbox == nil || dest == nil {
+			return errors.New("I/O error")
+		}
+
+		entries, err := inbox.listEntries()
+		if err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
+		for _, entry := range entries {
+			if err := entry.msg.MoveTo(dest.dir); err != nil {
+				return fmt.Errorf("I/O error: %w", err)
+			}
+		}
+
+		u.b.statesLock.Lock()
+		for key, meta := range inbox.state.messages {
+			dest.state.messages[key] = meta
+		}
+		if dest.state.uidNext < inbox.state.uidNext {
+			dest.state.uidNext = inbox.state.uidNext
+		}
+		inbox.state.messages = map[string]*messageMeta{}
+		u.b.statesLock.Unlock()
+
+		return nil
+	}
+	srcDir, err := u.storage.Dir(existingName)
 	if err != nil {
 		return err
 	}
-	fsPathNew, _, err := u.prepareMboxPath(newName)
+	exists, err := srcDir.Exists()
+	if err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+	if !exists {
+		return backend.ErrNoSuchMailbox
+	}
+	destDir, err := u.storage.Dir(newName)
 	if err != nil {
 		return err
 	}
-
-	if err := os.Rename(fsPathOld, fsPathNew); err != nil {
-		u.b.Log.Printf("failed to rename mailbox: %v", err)
-		return errors.New("I/O error")
+	exists, err = destDir.Exists()
+	if err != nil {
+		return fmt.Errorf("I/O error: %w", err)
 	}
-	u.b.Debug.Printf("rename mbox (%v, %v), (%v, %v)", existingName, fsPathOld, newName, fsPathNew)
+	if exists {
+		return backend.ErrMailboxAlreadyExists
+	}
+	relName, err := relativeMailboxName(existingName, newName)
+	if err != nil {
+		return err
+	}
+	if err := srcDir.Rename(relName); err != nil {
+		return fmt.Errorf("I/O error: %w", err)
+	}
+
+	u.mailboxesLock.Lock()
+	for name, mbox := range u.mailboxes {
+		if strings.HasPrefix(name, existingName) {
+			newChild := strings.Replace(name, existingName, newName, 1)
+			mbox.name = newChild
+			newDir, err := u.storage.Dir(newChild)
+			if err != nil {
+				continue
+			}
+			mbox.dir = newDir
+			u.mailboxes[newChild] = mbox
+			delete(u.mailboxes, name)
+			u.b.renameMailboxState(u.name, name, newChild)
+			u.b.Manager.MailboxDestroyed(u.name + "\x00" + name)
+			u.b.Manager.MailboxDestroyed(u.name + "\x00" + newChild)
+		}
+	}
+	u.mailboxesLock.Unlock()
+
 	return nil
 }
 
 func (u *User) Logout() error {
-	u.b.Debug.Printf("user logged out (%v, %v)", u.name, u.basePath)
 	return nil
 }
