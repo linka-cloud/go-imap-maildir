@@ -119,6 +119,8 @@ type User struct {
 
 	mboxLimitLock sync.Mutex
 	mboxLimits    map[string]*uint32
+
+	logoutOnce sync.Once
 }
 
 func (u *User) Username() string {
@@ -835,5 +837,17 @@ func (u *User) RenameMailbox(existingName, newName string) error {
 }
 
 func (u *User) Logout() error {
+	u.logoutOnce.Do(func() {
+		u.mailboxesLock.Lock()
+		u.mailboxes = nil
+		u.mailboxesLock.Unlock()
+
+		u.mboxLimitLock.Lock()
+		u.mboxLimits = nil
+		u.mboxLimitLock.Unlock()
+
+		u.b.userLogout(u.name)
+	})
+
 	return nil
 }

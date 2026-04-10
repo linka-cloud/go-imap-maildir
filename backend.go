@@ -32,6 +32,7 @@ type Backend struct {
 
 	statesLock sync.Mutex
 	states     map[string]*mailboxState
+	users      map[string]int
 }
 
 type mailboxState struct {
@@ -91,6 +92,7 @@ func (b *Backend) GetUser(username string) (backend.User, error) {
 		b.Log.Printf("failed to init inbox: %v", err)
 		return nil, fmt.Errorf("I/O error: %w", err)
 	}
+	b.userLogin(username)
 
 	return user, nil
 }
@@ -208,6 +210,11 @@ func (b *Backend) SetMessageLimit(val *uint32) error {
 }
 
 func (b *Backend) Close() error {
+	b.statesLock.Lock()
+	defer b.statesLock.Unlock()
+
+	b.states = map[string]*mailboxState{}
+	b.users = map[string]int{}
 	return nil
 }
 
@@ -223,7 +230,33 @@ func New(pathTemplate string, provider maildir.Provider, defaultMailboxes []Defa
 		StorageProvider:  provider,
 		Manager:          mess.NewManager(),
 		states:           map[string]*mailboxState{},
+		users:            map[string]int{},
 	}, nil
+}
+
+func (b *Backend) userLogin(username string) {
+	b.statesLock.Lock()
+	defer b.statesLock.Unlock()
+
+	b.users[username]++
+}
+
+func (b *Backend) userLogout(username string) {
+	b.statesLock.Lock()
+	defer b.statesLock.Unlock()
+
+	active := b.users[username]
+	if active <= 1 {
+		delete(b.users, username)
+		for key := range b.states {
+			if strings.HasPrefix(key, username+"\x00") {
+				delete(b.states, key)
+			}
+		}
+		return
+	}
+
+	b.users[username] = active - 1
 }
 
 func (b *Backend) mailboxKey(username, mailbox string) string {

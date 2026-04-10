@@ -256,6 +256,8 @@ func (b *Backend) deliverToRecipient(username, mailbox string, flags []string, r
 	if err != nil {
 		return err
 	}
+	defer user.Logout()
+
 	u, ok := user.(*User)
 	if !ok {
 		return errors.New("maildir: unsupported user implementation")
