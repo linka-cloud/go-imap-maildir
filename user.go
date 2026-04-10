@@ -561,7 +561,28 @@ func (u *User) mailboxLimit(mbox *Mailbox) *uint32 {
 func (u *User) CreateMessage(mboxName string, flags []string, date time.Time, body imap.Literal, selected backend.Mailbox) error {
 	mbox, ok := u.getMailbox(mboxName)
 	if !ok {
-		return backend.ErrNoSuchMailbox
+		if err := u.validateMboxName(mboxName); err != nil {
+			return err
+		}
+
+		mboxDir, err := u.storage.Dir(mboxName)
+		if err != nil {
+			return err
+		}
+		exists, err := mboxDir.Exists()
+		if err != nil {
+			return fmt.Errorf("I/O error: %w", err)
+		}
+		if !exists {
+			return backend.ErrNoSuchMailbox
+		}
+
+		u.mailboxesLock.Lock()
+		mbox = u.ensureMailbox(mboxName)
+		u.mailboxesLock.Unlock()
+		if mbox == nil {
+			return errors.New("I/O error")
+		}
 	}
 
 	newFlags := flags[:0]
