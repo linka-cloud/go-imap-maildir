@@ -638,6 +638,28 @@ func (d *Dir) Unseen() ([]maildir.Message, error) {
 	return msgs, nil
 }
 
+func (d *Dir) NewMessageKeys() ([]string, error) {
+	if err := d.ensurePrefix(false); err != nil {
+		return nil, err
+	}
+	keys, err := d.storage.listKeys(joinKey(d.prefix, "new"))
+	if err != nil {
+		if isNotFound(err) {
+			return nil, maildir.ErrNotExist
+		}
+		return nil, err
+	}
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		guid, _ := parsePointerKey(key)
+		if guid == "" {
+			continue
+		}
+		result = append(result, guid)
+	}
+	return result, nil
+}
+
 func (d *Dir) Messages() ([]maildir.Message, error) {
 	if err := d.ensurePrefix(false); err != nil {
 		return nil, err

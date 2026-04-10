@@ -187,6 +187,29 @@ func (d *Dir) Unseen() ([]imapmaildir.Message, error) {
 	return wrapMessages(msgs), nil
 }
 
+func (d *Dir) NewMessageKeys() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(string(d.dir), "new"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, imapmaildir.ErrNotExist
+		}
+		return nil, err
+	}
+	keys := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "" || name[0] == '.' {
+			continue
+		}
+		key, _, _ := strings.Cut(name, ":")
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
 func (d *Dir) Messages() ([]imapmaildir.Message, error) {
 	msgs, err := d.dir.Messages()
 	if err != nil {

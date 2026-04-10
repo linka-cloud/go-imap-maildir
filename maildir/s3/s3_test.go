@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +154,134 @@ func TestS3DeliveryAbort(t *testing.T) {
 	}
 	if len(msgs) != 0 {
 		t.Fatalf("expected 0 messages, got %d", len(msgs))
+	}
+}
+
+func TestS3IndexLockMutualExclusion(t *testing.T) {
+	storage, cleanup := newTestStorage(t)
+	defer cleanup()
+
+	inbox := mustInitDir(t, storage, "INBOX")
+	dir := inbox.(*Dir)
+
+	store, err := dir.IndexStore("guid-lock-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxStore := store.(*indexStore)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+
+	active := 0
+	maxActive := 0
+	var activeMu sync.Mutex
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := idxStore.withLock(func() error {
+				activeMu.Lock()
+				active++
+				if active > maxActive {
+					maxActive = active
+				}
+				activeMu.Unlock()
+
+				time.Sleep(20 * time.Millisecond)
+
+				activeMu.Lock()
+				active--
+				activeMu.Unlock()
+				return nil
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	if maxActive != 1 {
+		t.Fatalf("expected lock to serialize access, max concurrent owners=%d", maxActive)
+	}
+}
+
+func TestS3IndexLockAcrossStorageInstances(t *testing.T) {
+	client, bucket, rootPrefix, cleanup := s3testing.StartMinioShared(t)
+	defer cleanup()
+
+	basePath := "lock-cross-" + time.Now().UTC().Format("20060102150405.000000000")
+	storageA := NewProvider(client, bucket, rootPrefix).Storage(basePath).(*Storage)
+	storageB := NewProvider(client, bucket, rootPrefix).Storage(basePath).(*Storage)
+
+	dirA := mustInitDir(t, storageA, "INBOX")
+	dirB := mustDir(t, storageB, "INBOX")
+
+	storeA, err := dirA.(*Dir).IndexStore("guid-cross-lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeB, err := dirB.(*Dir).IndexStore("guid-cross-lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idxA := storeA.(*indexStore)
+	idxB := storeB.(*indexStore)
+
+	enteredA := make(chan struct{})
+	releaseA := make(chan struct{})
+	errA := make(chan error, 1)
+	go func() {
+		errA <- idxA.withLock(func() error {
+			close(enteredA)
+			<-releaseA
+			return nil
+		})
+	}()
+
+	select {
+	case <-enteredA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first storage instance did not acquire lock")
+	}
+
+	_, _ = storageB.listKeys(idxB.lockKey())
+
+	errB := make(chan error, 1)
+	go func() {
+		errB <- idxB.withLock(func() error {
+			return nil
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(releaseA)
+
+	select {
+	case err := <-errA:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first storage instance did not release lock")
+	}
+
+	select {
+	case err := <-errB:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second storage instance failed to acquire lock after release")
 	}
 }
 

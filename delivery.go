@@ -10,6 +10,8 @@ import (
 
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-message/textproto"
+
+	"github.com/foxcpp/go-imap-maildir/maildir"
 )
 
 type DeliveryTarget interface {
@@ -293,12 +295,23 @@ func (b *Backend) deliverToRecipient(username, mailbox string, flags []string, r
 		return err
 	}
 
-	u.mailboxesLock.Lock()
-	mbox := u.ensureMailbox(mailbox)
-	u.mailboxesLock.Unlock()
-	if mbox == nil {
-		return errors.New("maildir: failed to load mailbox state")
+	if lister, ok := mboxDir.(maildir.NewMessageKeyLister); ok {
+		keys, err := lister.NewMessageKeys()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			u.mailboxesLock.Lock()
+			mbox := u.ensureMailbox(mailbox)
+			u.mailboxesLock.Unlock()
+			if mbox == nil {
+				return errors.New("maildir: failed to load mailbox state")
+			}
+			if err := mbox.registerNewKeys(keys); err != nil {
+				return err
+			}
+		}
 	}
-	_, err = mbox.listEntries()
-	return err
+
+	return nil
 }

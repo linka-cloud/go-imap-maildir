@@ -1,6 +1,7 @@
 package imapmaildir
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -12,12 +13,20 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	sortthread "github.com/emersion/go-imap-sortthread"
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-imap/backend/backendutil"
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
+	"github.com/emersion/go-message/textproto"
 	mess "github.com/foxcpp/go-imap-mess"
 
 	"github.com/foxcpp/go-imap-maildir/maildir"
+	maildirindex "github.com/foxcpp/go-imap-maildir/maildir/index"
+)
+
+var (
+	_ sortthread.ThreadMailbox = (*SelectedMailbox)(nil)
 )
 
 type Mailbox struct {
@@ -34,6 +43,12 @@ type Mailbox struct {
 
 	limitLock   sync.Mutex
 	appendLimit *uint32
+
+	indexLock        sync.Mutex
+	indexLoaded      bool
+	indexStore       maildir.IndexStore
+	index            *maildirindex.Index
+	indexAppendCount int
 }
 
 type SelectedMailbox struct {
@@ -484,6 +499,14 @@ func (m *SelectedMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria
 	m.handle.ResolveCriteria(criteria)
 	defer m.handle.Sync(uid)
 
+	needsBody := searchNeedsBody(criteria)
+	needsFullHeaders := searchNeedsUnindexedHeaders(criteria)
+	idx, idxStore, idxErr := m.loadIndex()
+	if idxErr != nil {
+		idx = nil
+		idxStore = nil
+	}
+
 	var ids []uint32
 	for _, entry := range entries {
 		seq, ok := m.handle.UidAsSeq(entry.uid)
@@ -491,12 +514,29 @@ func (m *SelectedMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria
 			continue
 		}
 
-		entity, entErr := m.messageEntity(entry.msg)
-		if entity == nil {
-			if entErr != nil {
+		var entity *message.Entity
+		if needsBody {
+			entity, err = m.messageEntity(entry.msg)
+			if entity == nil {
+				if err != nil {
+					continue
+				}
 				continue
 			}
-			continue
+		} else {
+			var header textproto.Header
+			if needsFullHeaders {
+				header, err = m.messageHeader(entry.msg)
+			} else {
+				header, _, err = m.headerForEntry(entry, idx, idxStore)
+			}
+			if err != nil {
+				continue
+			}
+			entity, err = message.New(message.Header{Header: header}, bytes.NewReader(nil))
+			if err != nil {
+				continue
+			}
 		}
 
 		flags := m.entryFlags(entry, m.handle.IsRecent(entry.uid))
@@ -513,6 +553,429 @@ func (m *SelectedMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria
 	}
 
 	return ids, nil
+}
+
+func (m *SelectedMailbox) Thread(uid bool, threading sortthread.ThreadAlgorithm, searchCrit *imap.SearchCriteria) ([]*sortthread.Thread, error) {
+	if threading != sortthread.OrderedSubject {
+		return nil, errors.New("Unsupported threading algorithm")
+	}
+
+	entries, err := m.listEntries()
+	if err != nil {
+		return nil, errors.New("I/O error, try again later")
+	}
+
+	m.handle.ResolveCriteria(searchCrit)
+	defer m.handle.Sync(uid)
+
+	needsBody := searchNeedsBody(searchCrit)
+	needsFullHeaders := searchNeedsUnindexedHeaders(searchCrit)
+	idx, idxStore, idxErr := m.loadIndex()
+	if idxErr != nil {
+		idx = nil
+		idxStore = nil
+	}
+
+	type threadMsg struct {
+		id       uint32
+		sentDate time.Time
+	}
+
+	threads := make(map[string][]threadMsg)
+	matchedCount := 0
+
+	for _, entry := range entries {
+		seq, ok := m.handle.UidAsSeq(entry.uid)
+		if !ok {
+			continue
+		}
+
+		var header textproto.Header
+		var entity *message.Entity
+		if needsBody {
+			entity, err = m.messageEntity(entry.msg)
+			if entity == nil {
+				if err != nil {
+					continue
+				}
+				continue
+			}
+			header = entity.Header.Header
+		} else {
+			if needsFullHeaders {
+				header, err = m.messageHeader(entry.msg)
+			} else {
+				header, _, err = m.headerForEntry(entry, idx, idxStore)
+			}
+			if err != nil {
+				continue
+			}
+			entity, err = message.New(message.Header{Header: header}, bytes.NewReader(nil))
+			if err != nil {
+				continue
+			}
+		}
+
+		flags := m.entryFlags(entry, m.handle.IsRecent(entry.uid))
+		ok, err = backendutil.Match(entity, seq, entry.uid, entry.meta.internalDate, flags, searchCrit)
+		if err != nil || !ok {
+			continue
+		}
+
+		id := entry.uid
+		if !uid {
+			id = seq
+		}
+
+		mailHeader := mail.Header{Header: message.Header{Header: header}}
+		subject, err := mailHeader.Subject()
+		if err != nil {
+			subject = header.Get("Subject")
+		}
+		baseSubject, _ := sortthread.GetBaseSubject(subject)
+
+		sentDate, err := mailHeader.Date()
+		if err != nil {
+			sentDate = entry.meta.internalDate
+			if sentDate.IsZero() {
+				if info, statErr := entry.msg.Stat(); statErr == nil {
+					sentDate = info.ModTime()
+				}
+			}
+		} else {
+			sentDate = sentDate.UTC()
+		}
+
+		threads[baseSubject] = append(threads[baseSubject], threadMsg{
+			id:       id,
+			sentDate: sentDate,
+		})
+		matchedCount++
+	}
+
+	if matchedCount == 0 {
+		return []*sortthread.Thread{}, nil
+	}
+
+	sortedThreads := make([][]threadMsg, 0, len(threads))
+	for _, thread := range threads {
+		sort.Slice(thread, func(i, j int) bool {
+			if thread[i].sentDate.Equal(thread[j].sentDate) {
+				return thread[i].id < thread[j].id
+			}
+			return thread[i].sentDate.Before(thread[j].sentDate)
+		})
+		sortedThreads = append(sortedThreads, thread)
+	}
+
+	sort.Slice(sortedThreads, func(i, j int) bool {
+		if sortedThreads[i][0].sentDate.Equal(sortedThreads[j][0].sentDate) {
+			return sortedThreads[i][0].id < sortedThreads[j][0].id
+		}
+		return sortedThreads[i][0].sentDate.Before(sortedThreads[j][0].sentDate)
+	})
+
+	threadsTree := make([]sortthread.Thread, matchedCount)
+	nodeOffset := 0
+	result := make([]*sortthread.Thread, 0, len(sortedThreads))
+
+	for _, thread := range sortedThreads {
+		if len(thread) == 0 {
+			continue
+		}
+		current := &threadsTree[nodeOffset]
+		nodeOffset++
+		result = append(result, current)
+		current.Id = thread[0].id
+		for _, msg := range thread[1:] {
+			next := &threadsTree[nodeOffset]
+			nodeOffset++
+			next.Id = msg.id
+			current.Children = []*sortthread.Thread{next}
+			current = next
+		}
+	}
+
+	return result, nil
+}
+
+func searchNeedsBody(criteria *imap.SearchCriteria) bool {
+	if criteria == nil {
+		return false
+	}
+	if len(criteria.Body) > 0 || len(criteria.Text) > 0 || criteria.Larger > 0 || criteria.Smaller > 0 {
+		return true
+	}
+	for _, not := range criteria.Not {
+		if searchNeedsBody(not) {
+			return true
+		}
+	}
+	for _, or := range criteria.Or {
+		if searchNeedsBody(or[0]) || searchNeedsBody(or[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func searchNeedsUnindexedHeaders(criteria *imap.SearchCriteria) bool {
+	if criteria == nil {
+		return false
+	}
+	for name := range criteria.Header {
+		if _, ok := maildirindex.FieldIDFromName(name); !ok {
+			return true
+		}
+	}
+	for _, not := range criteria.Not {
+		if searchNeedsUnindexedHeaders(not) {
+			return true
+		}
+	}
+	for _, or := range criteria.Or {
+		if searchNeedsUnindexedHeaders(or[0]) || searchNeedsUnindexedHeaders(or[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Mailbox) loadIndex() (*maildirindex.Index, maildir.IndexStore, error) {
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+
+	if m.indexLoaded {
+		return m.index, m.indexStore, nil
+	}
+	if err := m.loadMetadataState(); err != nil {
+		return nil, nil, err
+	}
+	provider, ok := m.dir.(maildir.IndexProvider)
+	if !ok {
+		m.indexLoaded = true
+		return nil, nil, nil
+	}
+	store, err := provider.IndexStore(m.state.meta.GUID)
+	if err != nil {
+		return nil, nil, err
+	}
+	idx, err := store.Load()
+	if err != nil {
+		return nil, nil, err
+	}
+	m.indexStore = store
+	m.index = idx
+	m.indexLoaded = true
+	return idx, store, nil
+}
+
+func (m *Mailbox) headerForEntry(entry msgEntry, idx *maildirindex.Index, store maildir.IndexStore) (textproto.Header, *maildirindex.Entry, error) {
+	if idx != nil {
+		m.indexLock.Lock()
+		cached, ok := idx.Get(entry.msg.Key())
+		m.indexLock.Unlock()
+		if ok {
+			return m.headerFromIndexEntry(cached), cached, nil
+		}
+	}
+	header, err := m.messageHeader(entry.msg)
+	if err != nil {
+		return textproto.Header{}, nil, err
+	}
+	size := m.messageSize(entry.msg)
+	newEntry := m.buildIndexEntry(entry, header, size)
+	if idx != nil && store != nil && newEntry != nil {
+		m.upsertIndex(idx, store, newEntry)
+	}
+	return header, newEntry, nil
+}
+
+func (m *Mailbox) entryHeaderFromIndex(entry msgEntry, idx *maildirindex.Index) (textproto.Header, bool) {
+	if idx == nil {
+		return textproto.Header{}, false
+	}
+	m.indexLock.Lock()
+	cached, ok := idx.Get(entry.msg.Key())
+	m.indexLock.Unlock()
+	if !ok {
+		return textproto.Header{}, false
+	}
+	return m.headerFromIndexEntry(cached), true
+}
+
+func (m *Mailbox) headerFromIndexEntry(entry *maildirindex.Entry) textproto.Header {
+	var header textproto.Header
+	if entry == nil || entry.Headers == nil {
+		return header
+	}
+	ids := make([]int, 0, len(entry.Headers))
+	for id := range entry.Headers {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	for _, idVal := range ids {
+		id := maildirindex.FieldID(idVal)
+		name := maildirindex.FieldName(id)
+		if name == "" {
+			continue
+		}
+		for _, value := range entry.Headers[id] {
+			header.Add(name, value)
+		}
+	}
+	return header
+}
+
+func (m *Mailbox) buildIndexEntry(entry msgEntry, header textproto.Header, size uint32) *maildirindex.Entry {
+	if entry.msg == nil {
+		return nil
+	}
+	values := map[maildirindex.FieldID][]string{}
+	fields := []maildirindex.FieldID{
+		maildirindex.FieldSubject,
+		maildirindex.FieldFrom,
+		maildirindex.FieldTo,
+		maildirindex.FieldCc,
+		maildirindex.FieldDate,
+		maildirindex.FieldMsgID,
+		maildirindex.FieldInReply,
+		maildirindex.FieldRefs,
+	}
+	for _, id := range fields {
+		name := maildirindex.FieldName(id)
+		if name == "" {
+			continue
+		}
+		vals := headerValues(header, name)
+		if len(vals) > 0 {
+			values[id] = vals
+		}
+	}
+	internalDate := int64(0)
+	if !entry.meta.internalDate.IsZero() {
+		internalDate = entry.meta.internalDate.Unix()
+	}
+	return &maildirindex.Entry{
+		Key:          entry.msg.Key(),
+		UID:          entry.uid,
+		InternalDate: internalDate,
+		Size:         size,
+		Headers:      values,
+	}
+}
+
+func headerValues(header textproto.Header, key string) []string {
+	msgHeader := message.Header{Header: header}
+	fields := msgHeader.FieldsByKey(key)
+	var values []string
+	for fields.Next() {
+		value, err := fields.Text()
+		if err != nil {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		values = append(values, value)
+	}
+	return values
+}
+
+func (m *Mailbox) upsertIndex(idx *maildirindex.Index, store maildir.IndexStore, entry *maildirindex.Entry) {
+	if idx == nil || store == nil || entry == nil {
+		return
+	}
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+	idx.Upsert(entry)
+	_ = store.Append(maildirindex.UpsertRecord(entry))
+	m.indexAppendCount++
+	if m.indexAppendCount >= 128 {
+		_ = store.Snapshot(idx)
+		m.indexAppendCount = 0
+	}
+}
+
+func (m *Mailbox) deleteIndex(key string) {
+	idx, store, err := m.loadIndex()
+	if err != nil || idx == nil || store == nil {
+		return
+	}
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+	idx.Delete(key)
+	_ = store.Append(maildirindex.DeleteRecord(key))
+	m.indexAppendCount++
+	if m.indexAppendCount >= 128 {
+		_ = store.Snapshot(idx)
+		m.indexAppendCount = 0
+	}
+}
+
+func (m *Mailbox) messageHeader(msg maildir.Message) (textproto.Header, error) {
+	file, err := msg.Open()
+	if err != nil {
+		return textproto.Header{}, err
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	return textproto.ReadHeader(reader)
+}
+
+func (m *Mailbox) messageSize(msg maildir.Message) uint32 {
+	info, err := msg.Stat()
+	if err != nil {
+		return 0
+	}
+	size := info.Size()
+	if size <= 0 {
+		return 0
+	}
+	if size > int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(size)
+}
+
+func (m *Mailbox) registerNewKeys(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := m.loadMetadataState(); err != nil {
+		return err
+	}
+
+	m.b.statesLock.Lock()
+	defer m.b.statesLock.Unlock()
+
+	state := m.state.meta
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if state.UIDByKey[key] != 0 {
+			continue
+		}
+		uid := state.UIDNext
+		state.UIDNext++
+		state.UIDByKey[key] = uid
+		state.FilenameByUID[uid] = key
+		state.DirtyUIDList = true
+		meta := &messageMeta{uid: uid}
+		storeRecent := m.b.Manager.NewMessage(m.mailboxKey(), uid)
+		meta.recent = storeRecent
+		m.state.messages[key] = meta
+	}
+
+	m.state.uidNext = state.UIDNext
+	m.state.uidValidity = state.UIDValidity
+
+	if err := m.writeMetadataState(state); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *SelectedMailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation imap.FlagsOp, silent bool, flags []string) error {
@@ -598,6 +1061,9 @@ func (m *SelectedMailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest strin
 		return errors.New("I/O error, try again later")
 	}
 
+	srcIdx, _, _ := m.loadIndex()
+	destIdx, destStore, _ := destMbox.loadIndex()
+
 	defer m.handle.Sync(true)
 
 	seqset, err = m.handle.ResolveSeq(uid, seqset)
@@ -611,6 +1077,14 @@ func (m *SelectedMailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest strin
 	for _, entry := range entries {
 		if !seqset.Contains(entry.uid) {
 			continue
+		}
+
+		header, headerOk := m.entryHeaderFromIndex(entry, srcIdx)
+		if !headerOk {
+			if hdr, err := m.messageHeader(entry.msg); err == nil {
+				header = hdr
+				headerOk = true
+			}
 		}
 
 		src, err := entry.msg.Open()
@@ -656,6 +1130,12 @@ func (m *SelectedMailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest strin
 		storeRecent := m.b.Manager.NewMessage(destMbox.mailboxKey(), meta.uid)
 		meta.recent = storeRecent
 		m.b.statesLock.Unlock()
+
+		if headerOk && destIdx != nil && destStore != nil {
+			size := destMbox.messageSize(copied)
+			indexEntry := destMbox.buildIndexEntry(msgEntry{msg: copied, meta: meta, uid: uid}, header, size)
+			destMbox.upsertIndex(destIdx, destStore, indexEntry)
+		}
 	}
 
 	if err := destMbox.writeMetadataState(destMbox.state.meta); err != nil {
@@ -695,6 +1175,9 @@ func (m *SelectedMailbox) MoveMessages(uid bool, seqset *imap.SeqSet, dest strin
 		return errors.New("I/O error, try again later")
 	}
 
+	srcIdx, _, _ := m.loadIndex()
+	destIdx, destStore, _ := destMbox.loadIndex()
+
 	defer m.handle.Sync(true)
 
 	seqset, err = m.handle.ResolveSeq(uid, seqset)
@@ -708,6 +1191,14 @@ func (m *SelectedMailbox) MoveMessages(uid bool, seqset *imap.SeqSet, dest strin
 	for _, entry := range entries {
 		if !seqset.Contains(entry.uid) {
 			continue
+		}
+
+		header, headerOk := m.entryHeaderFromIndex(entry, srcIdx)
+		if !headerOk {
+			if hdr, err := m.messageHeader(entry.msg); err == nil {
+				header = hdr
+				headerOk = true
+			}
 		}
 
 		src, err := entry.msg.Open()
@@ -755,9 +1246,16 @@ func (m *SelectedMailbox) MoveMessages(uid bool, seqset *imap.SeqSet, dest strin
 		delete(m.state.messages, entry.msg.Key())
 		m.b.statesLock.Unlock()
 
+		if headerOk && destIdx != nil && destStore != nil {
+			size := destMbox.messageSize(copied)
+			indexEntry := destMbox.buildIndexEntry(msgEntry{msg: copied, meta: meta, uid: uid}, header, size)
+			destMbox.upsertIndex(destIdx, destStore, indexEntry)
+		}
+
 		if err := entry.msg.Remove(); err != nil {
 			m.b.Log.Printf("MoveMessages: remove: %v", err)
 		}
+		m.deleteIndex(entry.msg.Key())
 
 		m.handle.Removed(entry.uid)
 	}
@@ -787,6 +1285,7 @@ func (m *SelectedMailbox) Expunge() error {
 		m.b.statesLock.Lock()
 		delete(m.state.messages, entry.msg.Key())
 		m.b.statesLock.Unlock()
+		m.deleteIndex(entry.msg.Key())
 
 		m.handle.Removed(entry.uid)
 	}

@@ -1,6 +1,8 @@
 package imapmaildir
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
+	"github.com/emersion/go-message/textproto"
 
 	"github.com/foxcpp/go-imap-maildir/maildir"
 )
@@ -646,6 +649,15 @@ func (u *User) CreateMessage(mboxName string, flags []string, date time.Time, bo
 
 	if err := mbox.writeMetadataState(mbox.state.meta); err != nil {
 		return errors.New("I/O error, try again later")
+	}
+
+	if idx, store, err := mbox.loadIndex(); err == nil && idx != nil && store != nil {
+		reader := bufio.NewReader(bytes.NewReader(data))
+		header, err := textproto.ReadHeader(reader)
+		if err == nil {
+			indexEntry := mbox.buildIndexEntry(msgEntry{msg: msg, meta: meta, uid: uid}, header, uint32(len(data)))
+			mbox.upsertIndex(idx, store, indexEntry)
+		}
 	}
 
 	return nil

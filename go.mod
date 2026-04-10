@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/emersion/go-imap v1.2.2-0.20220928192137-6fac715be9cf
+	github.com/emersion/go-imap-sortthread v1.2.0
 	github.com/emersion/go-maildir v0.6.0
 	github.com/emersion/go-message v0.18.2
 	github.com/foxcpp/go-imap-backend-tests v0.0.0-20220105184719-e80aa29a5e16
@@ -17,7 +18,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
-	github.com/google/go-cmp v0.6.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect

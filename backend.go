@@ -10,10 +10,16 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	sortthread "github.com/emersion/go-imap-sortthread"
 	"github.com/emersion/go-imap/backend"
 	mess "github.com/foxcpp/go-imap-mess"
 
 	"github.com/foxcpp/go-imap-maildir/maildir"
+)
+
+var (
+	_ backend.Backend          = (*Backend)(nil)
+	_ sortthread.ThreadBackend = (*Backend)(nil)
 )
 
 type Backend struct {
@@ -207,6 +213,10 @@ func (b *Backend) SetMessageLimit(val *uint32) error {
 	copyVal := *val
 	b.appendLimit = &copyVal
 	return nil
+}
+
+func (b *Backend) SupportedThreadAlgorithms() []sortthread.ThreadAlgorithm {
+	return []sortthread.ThreadAlgorithm{sortthread.OrderedSubject}
 }
 
 func (b *Backend) Close() error {

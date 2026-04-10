@@ -3,6 +3,8 @@ package maildir
 import (
 	"io"
 	"time"
+
+	maildirindex "github.com/foxcpp/go-imap-maildir/maildir/index"
 )
 
 // Flag is a message flag.
@@ -65,6 +67,20 @@ type Provider interface {
 type AttributesStore interface {
 	Read() (map[string]string, error)
 	Write(attrs map[string]string) error
+}
+
+type IndexStore interface {
+	Load() (*maildirindex.Index, error)
+	Append(records ...maildirindex.Record) error
+	Snapshot(index *maildirindex.Index) error
+}
+
+type IndexProvider interface {
+	IndexStore(guid string) (IndexStore, error)
+}
+
+type NewMessageKeyLister interface {
+	NewMessageKeys() ([]string, error)
 }
 
 type Delivery interface {
