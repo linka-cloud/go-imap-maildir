@@ -97,7 +97,7 @@ func WriteUIDList(w io.Writer, state *maildir.Metadata) error {
 	slices.Sort(uids)
 
 	for _, uid := range uids {
-		name := state.FilenameByUID[uid]
+		name := BaseName(state.FilenameByUID[uid])
 		if name == "" {
 			continue
 		}
