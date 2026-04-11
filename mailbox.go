@@ -413,8 +413,8 @@ func (m *Mailbox) entryFlags(entry msgEntry, recent bool) []string {
 }
 
 func (m *SelectedMailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
-	defer close(ch)
 	defer m.handle.Sync(false)
+	defer close(ch)
 
 	entries, err := m.listEntries()
 	if err != nil {
