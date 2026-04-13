@@ -27,6 +27,7 @@ import (
 
 var (
 	_ sortthread.ThreadMailbox = (*SelectedMailbox)(nil)
+	_ sortthread.SortMailbox   = (*SelectedMailbox)(nil)
 )
 
 type Mailbox struct {
@@ -63,6 +64,18 @@ type msgEntry struct {
 	meta   *messageMeta
 	uid    uint32
 	seqNum uint32
+}
+
+type sortMsg struct {
+	uid      uint32
+	seq      uint32
+	arrival  time.Time
+	date     time.Time
+	size     uint32
+	subject  string
+	fromAddr string
+	toAddr   string
+	ccAddr   string
 }
 
 func (m *Mailbox) Name() string {
@@ -555,6 +568,123 @@ func (m *SelectedMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria
 	return ids, nil
 }
 
+func (m *SelectedMailbox) Sort(uid bool, sortCrit []sortthread.SortCriterion, searchCrit *imap.SearchCriteria) ([]uint32, error) {
+	entries, err := m.listEntries()
+	if err != nil {
+		return nil, errors.New("I/O error, try again later")
+	}
+
+	m.handle.ResolveCriteria(searchCrit)
+	defer m.handle.Sync(uid)
+
+	if len(sortCrit) == 0 {
+		sortCrit = []sortthread.SortCriterion{{Field: sortthread.SortArrival}}
+	}
+
+	needsBody := searchNeedsBody(searchCrit)
+	needsFullHeaders := searchNeedsUnindexedHeaders(searchCrit)
+	idx, idxStore, idxErr := m.loadIndex()
+	if idxErr != nil {
+		idx = nil
+		idxStore = nil
+	}
+
+	matched := make([]sortMsg, 0, len(entries))
+	for _, entry := range entries {
+		seq, ok := m.handle.UidAsSeq(entry.uid)
+		if !ok {
+			continue
+		}
+
+		var header textproto.Header
+		var entity *message.Entity
+		if needsBody {
+			entity, err = m.messageEntity(entry.msg)
+			if entity == nil {
+				if err != nil {
+					continue
+				}
+				continue
+			}
+			header = entity.Header.Header
+		} else {
+			if needsFullHeaders {
+				header, err = m.messageHeader(entry.msg)
+			} else {
+				header, _, err = m.headerForEntry(entry, idx, idxStore)
+			}
+			if err != nil {
+				continue
+			}
+			entity, err = message.New(message.Header{Header: header}, bytes.NewReader(nil))
+			if err != nil {
+				continue
+			}
+		}
+
+		flags := m.entryFlags(entry, m.handle.IsRecent(entry.uid))
+		ok, err = backendutil.Match(entity, seq, entry.uid, entry.meta.internalDate, flags, searchCrit)
+		if err != nil || !ok {
+			continue
+		}
+
+		mh := mail.Header{Header: message.Header{Header: header}}
+		subject, err := mh.Subject()
+		if err != nil {
+			subject = header.Get("Subject")
+		}
+
+		date, err := mh.Date()
+		if err != nil {
+			date = entry.meta.internalDate
+			if date.IsZero() {
+				if info, statErr := entry.msg.Stat(); statErr == nil {
+					date = info.ModTime()
+				}
+			}
+		} else {
+			date = date.UTC()
+		}
+
+		matched = append(matched, sortMsg{
+			uid:      entry.uid,
+			seq:      seq,
+			arrival:  entry.meta.internalDate,
+			date:     date,
+			size:     m.messageSize(entry.msg),
+			subject:  strings.ToLower(subject),
+			fromAddr: firstAddressSortKey(&mh, "From", header.Get("From")),
+			toAddr:   firstAddressSortKey(&mh, "To", header.Get("To")),
+			ccAddr:   firstAddressSortKey(&mh, "Cc", header.Get("Cc")),
+		})
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		for _, crit := range sortCrit {
+			cmp := compareSortField(matched[i], matched[j], crit.Field)
+			if cmp == 0 {
+				continue
+			}
+			if crit.Reverse {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return matched[i].seq < matched[j].seq
+	})
+
+	ids := make([]uint32, 0, len(matched))
+	for _, entry := range matched {
+		if uid {
+			ids = append(ids, entry.uid)
+			continue
+		}
+		ids = append(ids, entry.seq)
+	}
+
+	return ids, nil
+}
+
 func (m *SelectedMailbox) Thread(uid bool, threading sortthread.ThreadAlgorithm, searchCrit *imap.SearchCriteria) ([]*sortthread.Thread, error) {
 	if threading != sortthread.OrderedSubject {
 		return nil, errors.New("Unsupported threading algorithm")
@@ -697,6 +827,56 @@ func (m *SelectedMailbox) Thread(uid bool, threading sortthread.ThreadAlgorithm,
 	}
 
 	return result, nil
+}
+
+func firstAddressSortKey(header *mail.Header, field, fallback string) string {
+	addrs, err := header.AddressList(field)
+	if err == nil && len(addrs) > 0 {
+		if addr := strings.TrimSpace(addrs[0].Address); addr != "" {
+			return strings.ToLower(addr)
+		}
+		if name := strings.TrimSpace(addrs[0].Name); name != "" {
+			return strings.ToLower(name)
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(fallback))
+}
+
+func compareSortField(a, b sortMsg, field sortthread.SortField) int {
+	switch field {
+	case sortthread.SortArrival:
+		return compareTime(a.arrival, b.arrival)
+	case sortthread.SortCc:
+		return strings.Compare(a.ccAddr, b.ccAddr)
+	case sortthread.SortDate:
+		return compareTime(a.date, b.date)
+	case sortthread.SortFrom:
+		return strings.Compare(a.fromAddr, b.fromAddr)
+	case sortthread.SortSize:
+		if a.size < b.size {
+			return -1
+		}
+		if a.size > b.size {
+			return 1
+		}
+		return 0
+	case sortthread.SortSubject:
+		return strings.Compare(a.subject, b.subject)
+	case sortthread.SortTo:
+		return strings.Compare(a.toAddr, b.toAddr)
+	default:
+		return 0
+	}
+}
+
+func compareTime(a, b time.Time) int {
+	if a.Equal(b) {
+		return 0
+	}
+	if a.Before(b) {
+		return -1
+	}
+	return 1
 }
 
 func searchNeedsBody(criteria *imap.SearchCriteria) bool {
